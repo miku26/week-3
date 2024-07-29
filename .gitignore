@@ -1,0 +1,11 @@
+__pycache__
+.env
+*.pdf
+*.txt
+*.docx
+*.log
+*.db
+temp.py
+RAG.py
+data
+.dev
