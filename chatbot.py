@@ -262,7 +262,7 @@ def create_sidebar(conn, cursor):
         
         if st.button("New Chat"):
             st.session_state.current_session_id = create_new_session(cursor, conn)
-            st.experimental_rerun()
+            st.rerun()
         
         current_message = get_most_recent_user_message(cursor, st.session_state.current_session_id)
         st.write(f"Prompt: {current_message[:50]}..." if len(current_message) > 50 else current_message)
@@ -273,14 +273,14 @@ def create_sidebar(conn, cursor):
                 button_label = f"{first_message[:30]}..." if first_message else "Empty Chat"
                 if st.button(button_label, key=f"session_{session_id}"):
                     st.session_state.current_session_id = session_id
-                    st.experimental_rerun()
+                    st.rerun()
         
         if st.button("Clear All History"):
             cursor.execute("DELETE FROM messages")
             cursor.execute("DELETE FROM sessions")
             conn.commit()
             st.session_state.current_session_id = create_new_session(cursor, conn)
-            st.experimental_rerun()
+            st.rerun()
 
 def RAG_response(messages, db, model):
     """Generate a response using Retrieval-Augmented Generation (RAG)."""
