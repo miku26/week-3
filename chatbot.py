@@ -1,3 +1,4 @@
+# Import necessary libraries
 import streamlit as st
 from streamlit import _bottom
 from groq import Groq
@@ -19,19 +20,20 @@ from langchain.docstore.document import Document
 from dotenv import load_dotenv
 import io
 
+# Load environment variables
 load_dotenv()
-# Constants
-FAISS_PATH = "faiss_index"
-DB_NAME = 'chat_sessions.db' 
+
+# Define constants
+FAISS_PATH = "faiss_index"  # Path to store FAISS index
+DB_NAME = 'chat_sessions.db'  # SQLite database name
 
 # Initialize environment and clients
-
 GROQ_API_KEY = os.getenv('GROQ_API_KEY')
 client = Groq(api_key=GROQ_API_KEY, base_url='https://api.groq.com')
 embedding_function = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
 model = ChatGroq(temperature=0, model_name="mixtral-8x7b-32768")
 
-# Prompt template
+# Define the prompt template for RAG
 PROMPT_TEMPLATE = """
 Answer the question based only on the following context:
 
@@ -44,17 +46,21 @@ Answer the question based on the above context: {question}
 
 # File reading functions
 def read_pdf(content):
+    """Read and extract text from a PDF file."""
     pdf_reader = PyPDF2.PdfReader(io.BytesIO(content))
     return " ".join(page.extract_text() for page in pdf_reader.pages)
 
 def read_text(content):
+    """Read and decode text from a text file."""
     return content.decode('utf-8')
 
 def read_docx(content):
+    """Read and extract text from a DOCX file."""
     doc = docx.Document(io.BytesIO(content))
     return " ".join(paragraph.text for paragraph in doc.paragraphs)
 
 def read_file(file):
+    """Read content from various file types."""
     content = file.read()
     file_readers = {
         "application/pdf": read_pdf,
@@ -68,7 +74,7 @@ def read_file(file):
 
 # Database functions
 def initialize_db(embedding_function, uploaded_file):
-
+    """Initialize or reinitialize the FAISS database with uploaded file content."""
     if os.path.exists(FAISS_PATH):
         shutil.rmtree(FAISS_PATH)
         print("Removed existing FAISS index.")
@@ -96,7 +102,7 @@ def initialize_db(embedding_function, uploaded_file):
     return db
 
 def setup_sqlite_db():
-    
+    """Set up SQLite database for storing chat sessions and messages."""
     conn = sqlite3.connect(DB_NAME, check_same_thread=False)
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS sessions
@@ -113,11 +119,13 @@ def setup_sqlite_db():
     return conn, c
 
 def create_new_session(cursor, conn):
+    """Create a new chat session in the database."""
     cursor.execute("INSERT INTO sessions (created_at) VALUES (?)", (datetime.now(),))
     conn.commit()
     return cursor.lastrowid
 
 def get_all_sessions_with_first_message(cursor):
+    """Retrieve all chat sessions with their first user message."""
     cursor.execute("""
         SELECT s.id, m.content, s.created_at
         FROM sessions s
@@ -132,15 +140,18 @@ def get_all_sessions_with_first_message(cursor):
     return cursor.fetchall()
 
 def get_session_messages(cursor, session_id):
+    """Retrieve all messages for a given session."""
     cursor.execute("SELECT role, content FROM messages WHERE session_id = ? ORDER BY timestamp", (session_id,))
     return cursor.fetchall()
 
 def add_message_to_db(cursor, conn, session_id, role, content):
+    """Add a new message to the database."""
     cursor.execute("INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)",
               (session_id, role, content, datetime.now()))
     conn.commit()
 
 def get_most_recent_user_message(cursor, session_id):
+    """Get the most recent user message for a given session."""
     cursor.execute("""
         SELECT content
         FROM messages
@@ -152,8 +163,8 @@ def get_most_recent_user_message(cursor, session_id):
     return result[0] if result else "New Chat"
 
 # AI and NLP functions
-
 def voice_to_text():
+    """Convert voice input to text using speech recognition."""
     r = sr.Recognizer()
     try:
         with sr.Microphone() as source:
@@ -187,11 +198,12 @@ def voice_to_text():
     return None
 
 def is_general_query(input_text):
+    """Check if the input is a general query or greeting."""
     general_keywords = ['hello', 'hi', 'hey', 'how are you', 'what\'s up']
     return any(keyword in input_text.lower() for keyword in general_keywords)
 
-
 def get_groq_response(input_text):
+    """Get a response from the Groq API for general queries."""
     try:
         chat_completion = client.chat.completions.create(
             messages=[
@@ -222,6 +234,7 @@ def get_groq_response(input_text):
     
 # UI functions
 def setup_page():
+    """Set up the Streamlit page configuration and custom CSS."""
     st.set_page_config(page_title="AI Chatbot", page_icon="🤖", layout="wide")
     st.markdown("""
     <style>
@@ -238,10 +251,12 @@ def setup_page():
     """, unsafe_allow_html=True)
 
 def create_main_layout():
+    """Create the main layout for the chat interface."""
     main_col1, main_col2, main_col3 = st.columns([1, 6, 1])
     return main_col2
 
 def create_sidebar(conn, cursor):
+    """Create the sidebar with chat history and controls."""
     with st.sidebar:
         st.image('image.png', width=200, use_column_width=True)
         
@@ -268,6 +283,7 @@ def create_sidebar(conn, cursor):
             st.experimental_rerun()
 
 def RAG_response(messages, db, model):
+    """Generate a response using Retrieval-Augmented Generation (RAG)."""
     print("RAG_response function called")
     print("Messages received:", messages)
     
@@ -312,7 +328,8 @@ def RAG_response(messages, db, model):
     
     return formatted_response
 
-def process_input(user_input, uploaded_file, db, conn, cursor, chat_container):
+def process_input(user_input, uploaded_file, db, conn, cursor, chat_container,response_type):
+    """Process user input, including file uploads and text/voice messages."""
     # Handle file upload
     if uploaded_file and not st.session_state.file_processed:
         file_type = uploaded_file.type
@@ -331,14 +348,14 @@ def process_input(user_input, uploaded_file, db, conn, cursor, chat_container):
         print("User input received:", user_input)
         st.session_state.messages.append({"role": "user", "content": user_input})
         add_message_to_db(cursor, conn, st.session_state.current_session_id, "user", user_input)
-        print("helllo")
+              
         with chat_container.chat_message("user"):
             st.markdown(user_input)
 
         # Use the db from session state if available    
         current_db = st.session_state.db if st.session_state.db is not None else db
 
-        if current_db is None or is_general_query(user_input):
+        if response_type == "Groq" or (current_db is None and response_type == "RAG"):
             response = get_groq_response(user_input)
         else:
             print("Calling RAG_response with messages:", st.session_state.messages)
@@ -351,11 +368,12 @@ def process_input(user_input, uploaded_file, db, conn, cursor, chat_container):
 
     return db  # Return the current db state
 
-
 def main():
+    """Main function to run the Streamlit app."""
     setup_page()
     conn, cursor = setup_sqlite_db()
-        # Initialize session state variables
+    
+    # Initialize session state variables
     if "current_session_id" not in st.session_state:
         st.session_state.current_session_id = create_new_session(cursor, conn)
     
@@ -401,7 +419,7 @@ def main():
     with input_container:
         if "voice_input" not in st.session_state:
             st.session_state.voice_input = ""
-        
+        response_type = st.radio("Choose response type:", ("RAG", "Groq"), horizontal=True)
         st.markdown('<div class="input-container">', unsafe_allow_html=True)
         col1, col2, col3 = _bottom.columns([6, 1, 1])
         with col1:
@@ -481,7 +499,7 @@ def main():
         st.rerun()
     
     if uploaded_file or user_input:
-        st.session_state.db = process_input(user_input, uploaded_file, st.session_state.db, conn, cursor, chat_container)
+        st.session_state.db = process_input(user_input, uploaded_file, st.session_state.db, conn, cursor, chat_container, response_type)
         if uploaded_file:
             st.rerun()
 
