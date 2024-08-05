@@ -355,7 +355,7 @@ def process_input(user_input, uploaded_file, db, conn, cursor, chat_container,re
         # Use the db from session state if available    
         current_db = st.session_state.db if st.session_state.db is not None else db
 
-        if response_type == "Groq" or (current_db is None and response_type == "RAG"):
+        if response_type == "Normal_Query" or (current_db is None and response_type == "Normal_Query"):
             response = get_groq_response(user_input)
         else:
             print("Calling RAG_response with messages:", st.session_state.messages)
@@ -419,7 +419,7 @@ def main():
     with input_container:
         if "voice_input" not in st.session_state:
             st.session_state.voice_input = ""
-        response_type = st.radio("Choose response type:", ("RAG", "Groq"), horizontal=True)
+        response_type = st.radio("Choose response type:", ("File_Query", "Normal_Query"), horizontal=True)
         st.markdown('<div class="input-container">', unsafe_allow_html=True)
         col1, col2, col3 = _bottom.columns([6, 1, 1])
         with col1:
