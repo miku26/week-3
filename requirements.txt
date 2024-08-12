@@ -102,3 +102,5 @@ watchdog==4.0.1
 yarl==1.9.4
 yfinance
 prophet
+base64
+pandasai
