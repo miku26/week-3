@@ -2,7 +2,6 @@ import streamlit as st
 from streamlit import _bottom
 from groq import Groq
 import matplotlib.pyplot as plt
-import seaborn as sns
 import speech_recognition as sr
 import json
 import numpy as np
