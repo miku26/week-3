@@ -1,14 +1,22 @@
-# Import necessary libraries
 import streamlit as st
 from streamlit import _bottom
 from groq import Groq
+import matplotlib.pyplot as plt
+import seaborn as sns
 import speech_recognition as sr
+import json
+import numpy as np
+import regex as re
+import base64
 import sqlite3
 from datetime import datetime
 import os
+from pandasai import SmartDataframe
+from pandasai.exceptions import NoCodeFoundError
 import shutil
 import time
 from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.document_loaders import AzureAIDocumentIntelligenceLoader
 import groq
 import PyPDF2
 import docx
@@ -18,11 +26,15 @@ from langchain_groq import ChatGroq
 from langchain.prompts import ChatPromptTemplate
 from langchain.docstore.document import Document
 from dotenv import load_dotenv
+import pandas as pd
 import io
+from pandasai.llm.base import LLM
+import time
+from groq import RateLimitError
 
 # Load environment variables
 load_dotenv()
-
+user_defined_path = os.getcwd()
 # Define constants
 FAISS_PATH = "faiss_index"  # Path to store FAISS index
 DB_NAME = 'chat_sessions.db'  # SQLite database name
@@ -59,17 +71,78 @@ def read_docx(content):
     doc = docx.Document(io.BytesIO(content))
     return " ".join(paragraph.text for paragraph in doc.paragraphs)
 
+
+def read_csv(content):
+    return pd.read_csv(content)
+
+def read_xlsx(content):
+    return pd.read_excel(io.BytesIO(content))
+
+
+def create_smart_dataframe(data):
+    llm = ChatGroq(model_name="mixtral-8x7b-32768", api_key = os.environ["GROQ_API_KEY"])    
+    return SmartDataframe(data, config={
+        "llm": llm,
+        "enable_cache": True,
+        "conversation_memory": True,
+        "verbose": True,
+        "save_charts": True,
+        "use_error_correction_framework":True,
+        "_max_retries":6,
+        "allow_dangerous_code":True
+    })
+
+
+def display_data_preview(data):
+    """Display a preview of the data."""
+    st.write("Data preview:")
+    st.dataframe(data.head())
+
+def pandasai_query(query, sdf):
+    if query:
+        try:
+            # Get response from SmartDataframe
+            response = sdf.chat(str(query))
+            
+            # Check the type of response and handle accordingly
+            if isinstance(response, str) and response.startswith("exports/charts/"):
+                # Handle file path response
+                with open(response, "rb") as img_file:
+                    return img_file.read()
+            elif isinstance(response, str):
+                # Handle string response
+                return response
+            elif isinstance(response, pd.DataFrame):
+                # Handle tabular response
+                return response
+            elif isinstance(response, plt.Figure):
+                # Handle graphical response
+                buf = io.BytesIO()
+                response.savefig(buf, format="png")
+                return buf.getvalue()
+            else:
+                # Handle unknown response type
+                return f"Unsupported response type: {type(response)}"
+        except NoCodeFoundError:
+            return "No code found for the given query."
+        except Exception as e:
+            return f"An error occurred: {e}"
+    return None
+
 def read_file(file):
     """Read content from various file types."""
     content = file.read()
     file_readers = {
         "application/pdf": read_pdf,
         "text/": read_text,
-        "application/vnd.openxmlformats-officedocument.wordprocessingml.document": read_docx
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document": read_docx,
+        "text/csv": read_csv,
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": read_xlsx
+
     }
     for file_type, reader_func in file_readers.items():
         if file.type.startswith(file_type):
-            return reader_func(content)
+            return reader_func(content) 
     raise ValueError(f"Unsupported file type: {file.type}")
 
 # Database functions
@@ -88,9 +161,11 @@ def initialize_db(embedding_function, uploaded_file):
         print(content[:100])
         print("---")
         documents.append(Document(page_content=content, metadata={"source": uploaded_file.name}))
+
     except Exception as e:
         print(f"Error reading uploaded file: {str(e)}")
     
+
     if not documents:
         print("No documents were successfully loaded. Cannot create database.")
         return None
@@ -142,10 +217,36 @@ def get_all_sessions_with_first_message(cursor):
 def get_session_messages(cursor, session_id):
     """Retrieve all messages for a given session."""
     cursor.execute("SELECT role, content FROM messages WHERE session_id = ? ORDER BY timestamp", (session_id,))
-    return cursor.fetchall()
+    messages = []
+    for role, content in cursor.fetchall():
+        try:
+            # Try to parse as JSON first
+            parsed_content = json.loads(content)
+        except json.JSONDecodeError:
+            # If it's not JSON, it might be a base64 encoded image
+            if content.startswith('data:image') or (len(content) % 4 == 0 and re.match(r'^[A-Za-z0-9+/]+={0,2}$', content)):
+                parsed_content = base64_to_image(content)
+            else:
+                parsed_content = content
+        messages.append((role, parsed_content))
+    return messages
+
+def image_to_base64(image_bytes):
+    return base64.b64encode(image_bytes).decode('utf-8')
+
+def base64_to_image(base64_string):
+    if base64_string.startswith('data:image'):
+        # Remove the prefix if it exists
+        base64_string = base64_string.split(',')[1]
+    image_bytes = base64.b64decode(base64_string)
+    return image_bytes
 
 def add_message_to_db(cursor, conn, session_id, role, content):
     """Add a new message to the database."""
+    if isinstance(content, bytes):  # Check if content is image bytes
+        content = image_to_base64(content)
+    else:
+        content = json.dumps(content)
     cursor.execute("INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)",
               (session_id, role, content, datetime.now()))
     conn.commit()
@@ -287,86 +388,152 @@ def RAG_response(messages, db, model):
     print("RAG_response function called")
     print("Messages received:", messages)
     
-    # Filter messages to only include user messages
     user_messages = [msg for msg in messages if msg['role'] == 'user']
     
     if not user_messages:
         return "No user messages found in the conversation."
     
-    # Get the most recent user message
     query_text = user_messages[-1]['content']
     print("Query text:", query_text)
     
     if not query_text.strip():
         return "The last user message is empty. Please provide a question or statement."
     
-    results = db.similarity_search_with_score(query_text, k=3)
+    results = db.similarity_search_with_score(query_text, k=1)  # Reduced to 1 document
     
     if len(results) == 0:
         return "I couldn't find any relevant information to answer your question."
     
-    context_text = "\n\n---\n\n".join([doc.page_content for doc, _score in results])
+    context_text = results[0][0].page_content
     
     text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000,
+        chunk_size=1000,  # Further reduced
         chunk_overlap=100,
         length_function=len,
     )
     context_chunks = text_splitter.split_text(context_text)
-
-    responses = []
-    for chunk in context_chunks:
-        prompt_template = ChatPromptTemplate.from_template(PROMPT_TEMPLATE)
-        prompt = prompt_template.format(context=chunk, question=query_text)
-        
-        response_text = model.invoke(prompt)
-        responses.append(response_text.content)
-
-    combined_response = " ".join(responses)
-    sources = [doc.metadata.get("source", None) for doc, _score in results]
-    formatted_response = f"Response: {combined_response}\nSources: {sources}"
     
-    return formatted_response
+    # Limit the number of chunks to reduce token usage
+    max_chunks = 3
+    context_chunks = context_chunks[:max_chunks]
+    
+    combined_context = "\n\n---\n\n".join(context_chunks)
+    
+    prompt_template = ChatPromptTemplate.from_template(PROMPT_TEMPLATE)
+    prompt = prompt_template.format(context=combined_context, question=query_text)
+    
+    max_retries = 3
+    retry_delay = 10  # seconds
+    
+    for attempt in range(max_retries):
+        try:
+            response_text = model.invoke(prompt)
+            combined_response = response_text.content
+            
+            # Summarize only if the response is very long
+            if len(combined_response.split()) > 500:
+                summarization_prompt = ChatPromptTemplate.from_template(
+                    "Summarize the following text in about 500 words: {text}"
+                )
+                summary_prompt = summarization_prompt.format(text=combined_response)
+                summary_response = model.invoke(summary_prompt)
+                final_response = summary_response.content
+            else:
+                final_response = combined_response
 
-def process_input(user_input, uploaded_file, db, conn, cursor, chat_container,response_type):
-    """Process user input, including file uploads and text/voice messages."""
-    # Handle file upload
+            sources = [results[0][0].metadata.get("source", None)]
+            formatted_response = f"Response: {final_response}\nSource: {sources[0]}"
+            
+            return formatted_response
+        
+        except RateLimitError as e:
+            if attempt < max_retries - 1:
+                print(f"Rate limit reached. Retrying in {retry_delay} seconds...")
+                time.sleep(retry_delay)
+                retry_delay *= 2  # Exponential backoff
+            else:
+                return "I'm sorry, but I'm currently experiencing high demand. Please try again in a few minutes."
+        
+        except Exception as e:
+            return f"An unexpected error occurred: {str(e)}"
+
+    return "Failed to generate a response after multiple attempts. Please try again later."
+
+
+
+def handle_file_upload(uploaded_file, db):
     if uploaded_file and not st.session_state.file_processed:
-        file_type = uploaded_file.type
-        db = initialize_db(embedding_function, uploaded_file)
-        if db:
-            st.success("Database updated with the uploaded file.")
-            st.session_state.db = db  # Store the db in session state
+        if uploaded_file.type == "text/csv":
+            data = read_csv(uploaded_file)
+            st.session_state.smart_df = create_smart_dataframe(data)
+            st.session_state.uploaded_file_type = "csv"
+            print("smart df :", st.session_state.smart_df)
+            st.success("CSV file is loaded. You can now query the data.")
+            display_data_preview(data)
         else:
-            st.error("Failed to update the database with the uploaded file.")
+            db = initialize_db(embedding_function, uploaded_file)
+            if db:
+                st.success("document is uploaded.")
+                st.session_state.db = db
+                st.session_state.uploaded_file_type = uploaded_file.type
+            else:
+                st.error("Failed to update the database with the uploaded file.")
+        
         st.session_state.file_processed = True
         st.session_state.file_uploader_key += 1
-        return db  # Return the updated db
+    
+    return db
 
-    # Handle user input
+def handle_user_input(user_input, db, conn, cursor, chat_container, response_type):
     if user_input:
-        print("User input received:", user_input)
         st.session_state.messages.append({"role": "user", "content": user_input})
         add_message_to_db(cursor, conn, st.session_state.current_session_id, "user", user_input)
-              
+        
         with chat_container.chat_message("user"):
             st.markdown(user_input)
 
-        # Use the db from session state if available    
-        current_db = st.session_state.db if st.session_state.db is not None else db
-
-        if response_type == "Normal_Query" or (current_db is None and response_type == "Normal_Query"):
-            response = get_groq_response(user_input)
+        if response_type == "File_Query":
+            if st.session_state.uploaded_file_type == "csv":
+                # Handle CSV query
+                response = pandasai_query(str(user_input), st.session_state.smart_df)
+            elif st.session_state.uploaded_file_type in ["application/pdf", "text/plain", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"]:
+                # Handle PDF, TXT, DOCX query
+                response = RAG_response(st.session_state.messages, db, model)
+            else:
+                print("file type is ",st.session_state.uploaded_file_type)
+                response = "Unsupported file type for querying."
         else:
-            print("Calling RAG_response with messages:", st.session_state.messages)
-            response = RAG_response(st.session_state.messages, current_db, model)
+            # Normal query response
+            response = get_groq_response(user_input)
 
-        st.session_state.messages.append({"role": "assistant", "content": response})
-        add_message_to_db(cursor, conn, st.session_state.current_session_id, "assistant", response)
-        with chat_container.chat_message("assistant"):
-            st.markdown(response)
+        # Handle the response (this part remains largely unchanged)
+        if isinstance(response, str):
+            st.session_state.messages.append({"role": "assistant", "content": response})
+            with chat_container.chat_message("assistant"):
+                st.markdown(response)
+            add_message_to_db(cursor, conn, st.session_state.current_session_id, "assistant", response)
+        elif isinstance(response, pd.DataFrame):
+            st.session_state.messages.append({"role": "assistant", "content": str(response)})
+            with chat_container.chat_message("assistant"):
+                st.dataframe(response)
+            add_message_to_db(cursor, conn, st.session_state.current_session_id, "assistant", str(response))
+        elif isinstance(response, bytes):
+            st.session_state.messages.append({"role": "assistant", "content": "Here's the chart:"})
+            with chat_container.chat_message("assistant"):
+                st.image(response)
+            add_message_to_db(cursor, conn, st.session_state.current_session_id, "assistant", response)
+        else:
+            st.session_state.messages.append({"role": "assistant", "content": f"Unsupported response type: {type(response)}"})
+            with chat_container.chat_message("assistant"):
+                st.write(f"Unsupported response type: {type(response)}")
+            add_message_to_db(cursor, conn, st.session_state.current_session_id, "assistant", str(response))
+    
 
-    return db  # Return the current db state
+def process_input(user_input, uploaded_file, db, conn, cursor, chat_container, response_type):
+    """Process user input, including file uploads and text/voice messages."""
+    db = handle_file_upload(uploaded_file, db)
+    handle_user_input(user_input, db, conn, cursor, chat_container, response_type)
+    return db
 
 def main():
     """Main function to run the Streamlit app."""
@@ -395,6 +562,13 @@ def main():
     
     if "file_processed" not in st.session_state:
         st.session_state.file_processed = False
+    
+    if "smart_df" not in st.session_state:  
+        st.session_state.smart_df = None
+
+    if "uploaded_file_type" not in st.session_state:
+        st.session_state.uploaded_file_type = None
+    
     if "file_uploader_key" not in st.session_state:
         st.session_state.file_uploader_key = 0
     
@@ -413,7 +587,19 @@ def main():
     with chat_container:
         for message in st.session_state.messages[1:]:
             with st.chat_message(message["role"]):
-                st.markdown(message["content"])
+                content = message["content"]
+                if isinstance(content, bytes):
+                    st.image(content)
+                elif isinstance(content, str):
+                    if content.startswith("data:image"):
+                        # It's a base64 encoded image
+                        st.image(base64_to_image(content))
+                    else:
+                        st.markdown(content)
+                elif isinstance(content, pd.DataFrame):
+                    st.dataframe(content)
+                else:
+                    st.write(content)
     
     input_container = st.container()
     with input_container:
@@ -427,7 +613,8 @@ def main():
         with col2:
             mic_button = st.button("🎤", key="mic_button")
         with col3:
-            uploaded_file = st.file_uploader("Upload file", type=["txt", "pdf", "docx"], key=f"file_uploader_{st.session_state.file_uploader_key}", label_visibility="collapsed")   
+            uploaded_file = st.file_uploader("Upload file", type=["txt", "pdf", "docx","csv"], key=f"file_uploader", label_visibility="collapsed")   
+            
 
 
     css = '''
@@ -501,7 +688,7 @@ def main():
     if uploaded_file or user_input:
         st.session_state.db = process_input(user_input, uploaded_file, st.session_state.db, conn, cursor, chat_container, response_type)
         if uploaded_file:
-            st.rerun()
+            st.session_state.file_processed = False
 
     conn.close()
 
